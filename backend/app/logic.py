@@ -1,63 +1,125 @@
 from .schemas import IngestData, SystemStatus, ZoneStatus, Alert
 from datetime import datetime
+import numpy as np
 
-# This is our "in-memory database" for the hackathon
-# It will store the latest counts.
-# We'll key it by source_id (e.g., 'cam_01')
+# --- In-memory storage ---
 current_counts = {}
+density_history = {}  # For trend tracking (source_id -> list of densities)
+MAX_HISTORY = 10
 
 def process_new_data(data: IngestData):
     """
-    This function is called by the /api/ingest endpoint.
-    It updates our "in-memory database".
+    Updates the current crowd counts and maintains recent history for prediction.
     """
-    
-    # We just received data, let's print it to see it working!
-    print(f"Received data: {data.source_id}, Count: {data.data.count}")
-    
-    # Store the latest count
-    current_counts[data.source_id] = data.data.count
+    source = data.source_id
+    count = data.data.count
+    current_counts[source] = count
+
+    # Maintain history for each camera
+    if source not in density_history:
+        density_history[source] = []
+    density_history[source].append(count)
+    if len(density_history[source]) > MAX_HISTORY:
+        density_history[source] = density_history[source][-MAX_HISTORY:]
+
+def predict_future_risk(zone_id: str, density: float) -> str:
+    """
+    Simple trend-based predictor (AI logic placeholder).
+    Later, replace this with an ML model (trained on historical crowd data).
+    """
+    history = np.array(density_history.get(zone_id, []))
+    if len(history) < 3:
+        return "low"
+
+    # Compute trend (difference between last and average)
+    recent_trend = np.mean(np.diff(history[-3:]))
+    predicted_density = density + (recent_trend / 200.0)  # Normalize trend
+
+    # Clamp predicted density
+    predicted_density = min(max(predicted_density, 0.0), 1.0)
+
+    # Determine predicted risk
+    if predicted_density > 0.8:
+        return "high"
+    elif predicted_density > 0.5:
+        return "medium"
+    else:
+        return "low"
 
 def get_system_status() -> SystemStatus:
     """
-    This function is called by the /api/status endpoint.
-    It builds the status object for the frontend.
-    
-    --- FAKE DATA ---
-    Right now, we are hardcoding this. In the next step,
-    we will make this REAL based on the data in 'current_counts'.
+    Builds live + predicted crowd status for all zones.
     """
-    
-    # --- FAKE IT 'TIL YOU MAKE IT ---
-    # We will pretend 'cam_01' is 'gate_a'
+    # --- Get current densities ---
     gate_a_count = current_counts.get("cam_01", 0)
-    
-    # Simple logic: map count to density/risk
-    density = min(gate_a_count / 200.0, 1.0) # Assume 200 is "full"
-    risk = "low"
-    if density > 0.5: risk = "medium"
-    if density > 0.8: risk = "high"
-    
-    # Build the fake zones
+    stage_count = current_counts.get("cam_02", 0)
+
+    # Convert counts to normalized densities
+    density_a = min(gate_a_count / 200.0, 1.0)
+    density_b = min(stage_count / 200.0, 1.0)
+
+    # Risk mapping
+    def get_risk(d):
+        if d > 0.8:
+            return "high"
+        elif d > 0.5:
+            return "medium"
+        else:
+            return "low"
+
+    # Predict future risk
+    predicted_risk_a = predict_future_risk("cam_01", density_a)
+    predicted_risk_b = predict_future_risk("cam_02", density_b)
+
+    # Trend calculation (for UI)
+    def get_trend(source_id):
+        hist = density_history.get(source_id, [])
+        if len(hist) < 3:
+            return "stable"
+        diff = np.mean(np.diff(hist[-3:]))
+        if diff > 2:
+            return "up"
+        elif diff < -2:
+            return "down"
+        else:
+            return "stable"
+
     zone1 = ZoneStatus(
         zone_id="gate_a",
         display_name="Main Gate A",
-        density=density,
-        risk_level=risk,
-        predicted_risk_level=risk, # Just copy for now
-        trend="stable" # Fake for now
+        density=density_a,
+        risk_level=get_risk(density_a),
+        predicted_risk_level=predicted_risk_a,
+        trend=get_trend("cam_01"),
     )
-    
+
     zone2 = ZoneStatus(
         zone_id="stage_front",
         display_name="Stage Front",
-        density=0.4, # Hardcoded
-        risk_level="medium",
-        predicted_risk_level="medium",
-        trend="stable"
+        density=density_b,
+        risk_level=get_risk(density_b),
+        predicted_risk_level=predicted_risk_b,
+        trend=get_trend("cam_02"),
     )
-    
-    # No alerts for now
-    active_alerts = []
 
-    return SystemStatus(zones=[zone1, zone2], alerts=active_alerts)
+    # Alerts if risk high
+    alerts = []
+    if zone1.risk_level == "high":
+        alerts.append(Alert(
+            id="alert_1",
+            timestamp=datetime.utcnow(),
+            zone_id="gate_a",
+            title="⚠️ High Risk at Main Gate A",
+            message="Crowd density critical. Please redirect flow."
+        ))
+
+    if zone2.risk_level == "high":
+        alerts.append(Alert(
+            id="alert_2",
+            timestamp=datetime.utcnow(),
+            zone_id="stage_front",
+            title="⚠️ High Risk at Stage Front",
+            message="High density detected. Manage access routes."
+        ))
+
+    return SystemStatus(zones=[zone1, zone2], alerts=alerts)
