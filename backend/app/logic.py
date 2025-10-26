@@ -1,44 +1,59 @@
 from .schemas import IngestData, SystemStatus, ZoneStatus, Alert
 from datetime import datetime
 import numpy as np
+import os
+import joblib
 
 # --- In-memory storage ---
 current_counts = {}
-density_history = {}  # For trend tracking (source_id -> list of densities)
+density_history = {}  # For trend tracking (source_id -> list of counts)
 MAX_HISTORY = 10
 
+# --- Load trained ML model for prediction ---
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "crowd_predictor.pkl")
+if os.path.exists(MODEL_PATH):
+    model = joblib.load(MODEL_PATH)
+    print(f"✅ Loaded ML model from {MODEL_PATH}")
+else:
+    model = None
+    print(f"⚠️ ML model not found at {MODEL_PATH}, using trend-based prediction")
+
+# --- Update counts ---
 def process_new_data(data: IngestData):
     """
-    Updates the current crowd counts and maintains recent history for prediction.
+    Updates the current crowd counts and maintains recent history.
     """
     source = data.source_id
     count = data.data.count
     current_counts[source] = count
 
-    # Maintain history for each camera
+    # Maintain history
     if source not in density_history:
         density_history[source] = []
     density_history[source].append(count)
     if len(density_history[source]) > MAX_HISTORY:
         density_history[source] = density_history[source][-MAX_HISTORY:]
 
+
+# --- Prediction logic ---
 def predict_future_risk(zone_id: str, density: float) -> str:
     """
-    Simple trend-based predictor (AI logic placeholder).
-    Later, replace this with an ML model (trained on historical crowd data).
+    Predict risk using ML model if available, else fallback to trend-based prediction.
     """
-    history = np.array(density_history.get(zone_id, []))
-    if len(history) < 3:
-        return "low"
+    # Use ML model for gate_a
+    if model and zone_id == "cam_01":
+        prev_count = density_history.get(zone_id, [])[-1] if density_history.get(zone_id) else 0
+        predicted_count = model.predict([[prev_count]])[0]
+        predicted_density = min(max(predicted_count / 200.0, 0.0), 1.0)
+    else:
+        # Trend-based fallback
+        history = np.array(density_history.get(zone_id, []))
+        if len(history) < 3:
+            return "low"
+        recent_trend = np.mean(np.diff(history[-3:]))
+        predicted_density = min(max(density + (recent_trend / 200.0), 0.0), 1.0)
 
-    # Compute trend (difference between last and average)
-    recent_trend = np.mean(np.diff(history[-3:]))
-    predicted_density = density + (recent_trend / 200.0)  # Normalize trend
-
-    # Clamp predicted density
-    predicted_density = min(max(predicted_density, 0.0), 1.0)
-
-    # Determine predicted risk
+    # Determine risk level
     if predicted_density > 0.8:
         return "high"
     elif predicted_density > 0.5:
@@ -46,15 +61,16 @@ def predict_future_risk(zone_id: str, density: float) -> str:
     else:
         return "low"
 
+
 def get_system_status() -> SystemStatus:
     """
-    Builds live + predicted crowd status for all zones.
+    Returns live and predicted crowd status for all zones.
     """
-    # --- Get current densities ---
+    # Current counts
     gate_a_count = current_counts.get("cam_01", 0)
     stage_count = current_counts.get("cam_02", 0)
 
-    # Convert counts to normalized densities
+    # Convert to density
     density_a = min(gate_a_count / 200.0, 1.0)
     density_b = min(stage_count / 200.0, 1.0)
 
@@ -67,11 +83,11 @@ def get_system_status() -> SystemStatus:
         else:
             return "low"
 
-    # Predict future risk
+    # Predicted risk
     predicted_risk_a = predict_future_risk("cam_01", density_a)
     predicted_risk_b = predict_future_risk("cam_02", density_b)
 
-    # Trend calculation (for UI)
+    # Trend calculation for UI
     def get_trend(source_id):
         hist = density_history.get(source_id, [])
         if len(hist) < 3:
